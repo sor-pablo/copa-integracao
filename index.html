@@ -320,56 +320,93 @@ function mkFutTarde() {
 //  API  –  JSONBin.io v3
 // ══════════════════════════════════════════════════════════════════
 async function apiSalvar(manual) {
-  if (saving) { if(manual) toast('Aguarde, já está salvando...'); return; }
+  // Salva SEMPRE no localStorage primeiro (instantâneo, nunca falha)
+  try { localStorage.setItem('copa_bkp', JSON.stringify(D)); } catch(e) {}
+
+  if (saving) { if(manual) toast('Aguarde...'); return; }
   saving = true;
-  const _t = setTimeout(()=>{ saving=false; },10000);
+  const _t = setTimeout(() => { saving = false; }, 10000);
   setSync('salvando');
-  try { localStorage.setItem('copa_bkp', JSON.stringify(D)); } catch(e){}
+
   try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
     const r = await fetch(JWRITE, {
-      method:'PUT',
-      headers:{ 'Content-Type':'application/json', 'X-Master-Key':JKEY, 'X-Bin-Versioning':'false' },
-      body: JSON.stringify(D)
+      method: 'PUT',
+      headers: {
+        'Content-Type':    'application/json',
+        'X-Master-Key':    JKEY,
+        'X-Bin-Versioning':'false'
+      },
+      body: JSON.stringify(D),
+      signal: controller.signal
     });
+    clearTimeout(timer);
+
     if (!r.ok) {
-      const t = await r.text().catch(()=>'');
-      console.error('[Copa] PUT',r.status,t);
+      const txt = await r.text().catch(() => '');
+      console.error('[Copa] PUT falhou', r.status, txt);
       throw new Error('HTTP ' + r.status);
     }
-    console.log('[Copa] Salvo OK');
+    console.log('[Copa] Salvo na nuvem OK');
     setSync('ok');
-    if (manual) toast('Dados salvos no servidor!');
+    if (manual) toast('Salvo no servidor!');
   } catch(e) {
-    console.error('[Copa] Erro save:',e.message);
+    console.warn('[Copa] Nuvem indisponível ao salvar (' + e.message + '). Dados guardados localmente.');
     setSync('erro');
-    toast('Erro ao salvar: ' + e.message);
-  } finally { clearTimeout(_t); saving=false; }
+    if (manual) toast('Salvo localmente (nuvem indisponível).');
+  } finally {
+    clearTimeout(_t);
+    saving = false;
+  }
 }
 
 async function apiCarregar() {
   setSync('carregando');
+
+  // 1. Tenta carregar do localStorage imediatamente (não bloqueia)
   try {
-    const r = await fetch(JREAD, { headers:{ 'X-Master-Key':JKEY } });
+    const raw = localStorage.getItem('copa_bkp');
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && p.futebol && p.volei) {
+        D = p;
+        console.log('[Copa] Dados carregados do backup local');
+      }
+    }
+  } catch(e) {}
+
+  // 2. Tenta a nuvem com timeout de 8s
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const r = await fetch(JREAD, {
+      headers: { 'X-Master-Key': JKEY },
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
     if (r.status === 404) { setSync('ok'); return false; }
     if (!r.ok) throw new Error('HTTP ' + r.status);
+
     const json = await r.json();
-    const rec  = json?.record;  // JSONBin v3 encapsula em .record
+    const rec  = json?.record; // JSONBin v3 encapsula em .record
     if (rec && rec.futebol && rec.volei) {
       D = rec;
-      try { localStorage.setItem('copa_bkp', JSON.stringify(D)); } catch(e){}
-      console.log('[Copa] Carregado da nuvem');
+      try { localStorage.setItem('copa_bkp', JSON.stringify(D)); } catch(e) {}
+      console.log('[Copa] Sincronizado com a nuvem');
       setSync('ok');
       return true;
     }
     setSync('ok');
     return false;
   } catch(e) {
-    console.error('[Copa] Erro load:',e.message);
-    setSync('erro');
-    try {
-      const raw = localStorage.getItem('copa_bkp');
-      if (raw) { const p=JSON.parse(raw); if(p&&p.futebol&&p.volei){D=p;return true;} }
-    } catch(e2){}
+    // Erro de rede (Load failed, timeout, CORS) – não é crítico
+    // Os dados do localStorage já foram carregados acima
+    console.warn('[Copa] Nuvem indisponível (' + e.message + '). Usando dados locais.');
+    // Mostra conectado se tiver dados locais, erro só se não tiver nada
+    const temDados = D.futebol.manha || D.futebol.tarde || D.volei.manha || D.volei.tarde;
+    setSync(temDados ? 'ok' : 'erro');
     return false;
   }
 }
@@ -411,7 +448,15 @@ function getComp() { return D[SP][TR]; }
 
 // ── PONTOS CORRIDOS – recálculo de tabela ─────────────────────────
 function recalcPC(comp) {
+  // Garante que as estruturas C1/C2 existem (podem ter sumido após JSON.parse)
+  if (!comp.C1 || !comp.C1.tab) {
+    const base = mkFutTarde();
+    comp.C1 = comp.C1 || base.C1;
+    comp.C2 = comp.C2 || base.C2;
+  }
+  // Reinicia contadores
   ['C1','C2'].forEach(ck => {
+    if (!comp[ck] || !comp[ck].tab) return;
     comp[ck].tab.forEach(r=>{ r.j=0;r.v=0;r.e=0;r.d=0;r.gp=0;r.gc=0;r.sg=0;r.pts=0; });
   });
   comp.jogos.forEach(jogo => {
@@ -1033,15 +1078,33 @@ function closeAdmin(){document.getElementById('adminPanel').style.display='none'
 // ══════════════════════════════════════════════════════════════════
 window.onload = async function() {
   setSync('carregando');
-  // Carrega históricos fixos
+
+  // Carrega históricos fixos como estado base
   D.futebol.manha = HIST_FM;
   D.futebol.tarde = mkFutTarde();
-  try { localStorage.setItem('copa_bkp', JSON.stringify(D)); } catch(e){}
-  // Tenta nuvem (sobrescreve se houver dados mais recentes)
+  try { localStorage.setItem('copa_bkp', JSON.stringify(D)); } catch(e) {}
+
+  // Tenta carregar da nuvem (sobrescreve se houver dados mais recentes)
   await apiCarregar();
-  // Garante que os fixos existem se a nuvem estiver vazia
+
+  // Garante que os históricos existem caso a nuvem esteja vazia
   if (!D.futebol.manha) D.futebol.manha = HIST_FM;
   if (!D.futebol.tarde) D.futebol.tarde = mkFutTarde();
+
+  // Recompõe tabelas e fase final do Futebol Tarde após carregar da nuvem
+  // (necessário porque JSON.parse cria novos objetos sem referências cruzadas)
+  if (D.futebol.tarde && D.futebol.tarde.tipo === 'pontoscorridos') {
+    // Garante que C1 e C2 existem com a estrutura correcta
+    const ft = D.futebol.tarde;
+    if (!ft.C1 || !ft.C1.tab) ft.C1 = mkFutTarde().C1;
+    if (!ft.C2 || !ft.C2.tab) ft.C2 = mkFutTarde().C2;
+    // Garante que terceiro e final existem
+    if (!ft.terceiro) ft.terceiro = mkFutTarde().terceiro;
+    if (!ft.final)    ft.final    = mkFutTarde().final;
+    // Recalcula tabelas a partir dos jogos já finalizados
+    recalcPC(ft);
+  }
+
   renderView();
   startPolling();
 };
